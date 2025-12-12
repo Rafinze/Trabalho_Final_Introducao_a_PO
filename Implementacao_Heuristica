@@ -1,0 +1,479 @@
+# -*- coding: utf-8 -*-
+"""
+Otimização de Portfólio via BRKGA.
+Refatorado para boas práticas e estrutura limpa.
+"""
+
+import numpy as np
+import pandas as pd
+import random
+import matplotlib.pyplot as plt
+from scipy.interpolate import PchipInterpolator
+from typing import Dict, List, Tuple, Any, Optional
+
+# ============================================================
+# CONFIGURAÇÕES GERAIS E CONSTANTES
+# ============================================================
+
+class Config:
+    """Centraliza constantes e caminhos de arquivo."""
+    # Caminhos de Entrada
+    ARQ_MU = "vetor_retornos_calculado.csv"
+    ARQ_SIGMA = "matriz_covariancia_calculada.csv"
+    ARQ_SETORES = "mapeamento_setores.csv"
+    # Caminho para comparação (Modelo Exato)
+    ARQ_EXATO = "/content/relatorio_resumo.csv"
+    
+    # Caminho de Saída
+    PATH_RESULTS = "./"  # Ajuste conforme necessário
+
+    # Parâmetros do Problema
+    M = 15  # Número de ativos a selecionar
+    LAMBDA_LIST = np.linspace(0, 1, 40)
+    W_MAX = 0.25
+    W_MIN = 0.01
+
+    # Parâmetros BRKGA
+    POP_SIZE = 600
+    ELITE_RATE = 0.20
+    MUTANT_RATE = 0.10
+    RHO = 0.7
+    N_GENERATIONS = 200
+
+    # Definições Setoriais
+    SETORES_MAP = {
+        "TECNOLOGIA": ["Information Technology"],
+        "ENERGIA_ELETRICA": ["Utilities", "Energy"],
+        "DEFENSIVOS": ["Consumer Staples", "Health Care"],
+        "CICLICOS": ["Consumer Discretionary", "Industrials", "Communication Services"],
+        "COMMODITIES": ["Materials", "Energy"],
+        "SENSIVEIS_JUROS": ["Real Estate", "Financials"]
+    }
+
+# ============================================================
+# FUNÇÕES UTILITÁRIAS
+# ============================================================
+
+def normalizar_nome_setor(nome: str) -> str:
+    """Normaliza nomes de setores para um padrão comum."""
+    if pd.isna(nome) or nome is None:
+        return "Indefinido"
+    
+    nome = nome.strip()
+    mapa_correcao = {
+        "Consumer Defensive": "Consumer Staples",
+        "Healthcare": "Health Care",
+        "Basic Materials": "Materials",
+        "Technology": "Information Technology",
+        "Financial Services": "Financials",
+    }
+    
+    return mapa_correcao.get(nome, nome)
+
+def project_to_bounded_simplex(raw_w: np.ndarray, w_min: float, w_max: float) -> Tuple[np.ndarray, bool]:
+    """
+    Projeta um vetor de pesos no simplexo respeitando limites min/max.
+    Retorna: (pesos_ajustados, is_feasible)
+    """
+    n = len(raw_w)
+    w = np.clip(raw_w, w_min, w_max)
+    soma = w.sum()
+
+    if abs(soma - 1.0) < 1e-12:
+        return w, True
+
+    if soma > 1:
+        free_indices = (w > w_min)
+        excess = soma - 1
+        w_free = w[free_indices] - w_min
+        total_free = w_free.sum()
+
+        if total_free <= 0:
+            return w, False
+        
+        reduction = excess * (w_free / total_free)
+        w[free_indices] -= reduction
+        return w, True
+    else:
+        deficit = 1 - soma
+        free_indices = (w < w_max)
+        w_free = w_max - w[free_indices]
+        total_free = w_free.sum()
+
+        if total_free <= 0:
+            return w, False
+        
+        increment = deficit * (w_free / total_free)
+        w[free_indices] += increment
+        return w, True
+
+# ============================================================
+# CLASSE DE DADOS E CARREGAMENTO
+# ============================================================
+
+class MarketData:
+    """Gerencia o carregamento e pré-processamento dos dados de mercado."""
+    
+    def __init__(self, arq_mu: str, arq_sigma: str, arq_setores: str):
+        self.mu, self.tickers = self._load_mu(arq_mu)
+        self.sigma = self._load_sigma(arq_sigma, self.tickers)
+        self.ticker_to_sector = self._load_sectors(arq_setores, self.tickers)
+        
+        self.mu_vec = self.mu.values
+        self.sigma_mat = self.sigma.values
+        self.n_assets = len(self.tickers)
+
+        print(f"Dados carregados com sucesso. Ativos: {self.n_assets}")
+
+    def _load_mu(self, path: str) -> Tuple[pd.Series, List[str]]:
+        try:
+            df = pd.read_csv(path, index_col=0)
+            if isinstance(df, pd.DataFrame) and df.shape[1] == 1:
+                series = df.iloc[:, 0]
+            else:
+                series = df # Assume series se não for DF
+            return series, list(series.index)
+        except FileNotFoundError:
+            raise FileNotFoundError(f" ERRO: Arquivo {path} não encontrado.")
+
+    def _load_sigma(self, path: str, tickers: List[str]) -> pd.DataFrame:
+        try:
+            df = pd.read_csv(path, index_col=0)
+            return df.loc[tickers, tickers]
+        except FileNotFoundError:
+            raise FileNotFoundError(f" ERRO: Arquivo {path} não encontrado.")
+        except KeyError:
+            raise ValueError(" ERRO: Matriz Sigma incompatível com tickers de Mu.")
+
+    def _load_sectors(self, path: str, tickers: List[str]) -> Dict[str, str]:
+        try:
+            df = pd.read_csv(path)
+            df = df[df["Ticker"].isin(tickers)]
+            
+            mapping = dict(zip(df["Ticker"], df["Setor"]))
+            
+            # Normalização e preenchimento
+            final_mapping = {}
+            for t in tickers:
+                raw_sector = mapping.get(t, "Indefinido")
+                final_mapping[t] = normalizar_nome_setor(raw_sector)
+            
+            return final_mapping
+        except FileNotFoundError:
+            raise FileNotFoundError(f" ERRO: Arquivo {path} não encontrado.")
+
+# ============================================================
+# CORE DO OTIMIZADOR (BRKGA)
+# ============================================================
+
+class PortfolioOptimizer:
+    """Executa a otimização de portfólio usando algoritmo genético (BRKGA)."""
+
+    def __init__(self, data: MarketData, config: Config):
+        self.data = data
+        self.cfg = config
+        self.chrom_size = 2 * config.M
+        
+        # Parâmetros derivados para facilitar acesso
+        self.n_elite = int(config.POP_SIZE * config.ELITE_RATE)
+        self.n_mutant = int(config.POP_SIZE * config.MUTANT_RATE)
+        self.n_offspring = config.POP_SIZE - self.n_elite - self.n_mutant
+
+    def _calculate_metrics(self, w: np.ndarray, selected_indices: List[int]) -> Dict[str, Any]:
+        """Calcula risco, retorno e contagem setorial de uma carteira."""
+        retorno = float(np.dot(w, self.data.mu_vec))
+        risco = float(np.sqrt(w @ self.data.sigma_mat @ w))
+
+        active_tickers = [self.data.tickers[i] for i in selected_indices if w[i] > 0]
+        sectors = {self.data.ticker_to_sector.get(t, "Indefinido") for t in active_tickers}
+
+        # Contagem setorial
+        counts = {
+            "n_total_setores": len(sectors),
+            "n_defensivos": sum(1 for s in sectors if s in self.cfg.SETORES_MAP["DEFENSIVOS"]),
+            "n_ciclicos": sum(1 for s in sectors if s in self.cfg.SETORES_MAP["CICLICOS"]),
+            "n_commodities": sum(1 for s in sectors if s in self.cfg.SETORES_MAP["COMMODITIES"]),
+            "n_juros": sum(1 for s in sectors if s in self.cfg.SETORES_MAP["SENSIVEIS_JUROS"]),
+            "n_tec": sum(1 for s in sectors if s in self.cfg.SETORES_MAP["TECNOLOGIA"]),
+            "n_ene": sum(1 for s in sectors if s in self.cfg.SETORES_MAP["ENERGIA_ELETRICA"]),
+        }
+        
+        return {"retorno": retorno, "risco": risco, **counts}
+
+    def decoder(self, random_keys: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """Converte cromossomo em pesos de ativos e métricas."""
+        keys_sel = random_keys[:self.cfg.M]
+        keys_w = random_keys[self.cfg.M:]
+
+        # Seleção sem duplicidade
+        disponiveis = list(range(self.data.n_assets))
+        selecionados = []
+        
+        for key in keys_sel:
+            idx = int(key * len(disponiveis))
+            # Correção de limite superior caso key seja exatamente 1.0
+            idx = min(idx, len(disponiveis) - 1)
+            selecionados.append(disponiveis.pop(idx))
+
+        # Cálculo de pesos
+        raw_weights = np.maximum(keys_w[:self.cfg.M], 0)
+        w_sel, _ = project_to_bounded_simplex(raw_weights, self.cfg.W_MIN, self.cfg.W_MAX)
+
+        # Mapeamento para vetor completo
+        w_final = np.zeros(self.data.n_assets)
+        w_final[selecionados] = w_sel
+        
+        binary_vec = np.zeros(self.data.n_assets, dtype=int)
+        binary_vec[selecionados] = 1
+
+        metrics = self._calculate_metrics(w_final, selecionados)
+        return w_final, binary_vec, metrics
+
+    def fitness(self, random_keys: np.ndarray, lambd: float) -> float:
+        """Calcula a função objetivo com penalidades."""
+        _, _, met = self.decoder(random_keys)
+        
+        obj = lambd * met["risco"] - (1 - lambd) * met["retorno"]
+        penalty = 0.0
+        P = 1000.0
+
+        # Regras de Negócio (Penalidades)
+        if met["n_total_setores"] < 4:
+            penalty += P * (4 - met["n_total_setores"])
+        
+        if met["n_tec"] > 0 and met["n_ene"] == 0:
+            penalty += P
+            
+        if met["n_defensivos"] < 1:
+            penalty += P * (1 - met["n_defensivos"])
+            
+        if met["n_ciclicos"] < 1:
+            penalty += P * (1 - met["n_ciclicos"])
+            
+        if met["n_commodities"] > 1:
+            penalty += P * (met["n_commodities"] - 1)
+            
+        if met["n_juros"] > 2:
+            penalty += P * (met["n_juros"] - 2)
+
+        return obj + penalty
+
+    def run_optimization(self, seeds: List[int]) -> pd.DataFrame:
+        """Executa o loop principal de otimização (Seeds -> Lambdas -> Gerações)."""
+        results = []
+
+        for seed in seeds:
+            np.random.seed(seed)
+            random.seed(seed)
+            print(f"Executando Seed {seed}...")
+
+            for lambd in self.cfg.LAMBDA_LIST:
+                # População Inicial
+                population = [np.random.rand(self.chrom_size) for _ in range(self.cfg.POP_SIZE)]
+                best_ind = None
+                best_fit = float("inf")
+
+                for _ in range(self.cfg.N_GENERATIONS):
+                    # Avaliação
+                    fits = [self.fitness(ind, lambd) for ind in population]
+                    
+                    # Ordenação
+                    sorted_idx = np.argsort(fits)
+                    population = [population[i] for i in sorted_idx]
+                    fits = [fits[i] for i in sorted_idx]
+
+                    if fits[0] < best_fit:
+                        best_fit = fits[0]
+                        best_ind = population[0].copy()
+
+                    # Evolução
+                    elites = population[:self.n_elite]
+                    non_elites = population[self.n_elite:]
+                    new_pop = elites[:]
+
+                    # Crossover
+                    for _ in range(self.n_offspring):
+                        parent_a = random.choice(elites)
+                        parent_b = random.choice(non_elites)
+                        mask = np.random.rand(self.chrom_size) < self.cfg.RHO
+                        child = np.where(mask, parent_a, parent_b)
+                        new_pop.append(child)
+
+                    # Mutação
+                    for _ in range(self.n_mutant):
+                        new_pop.append(np.random.rand(self.chrom_size))
+                    
+                    population = new_pop
+
+                # Processar Melhor Solução
+                w_best, b_best, met = self.decoder(best_ind)
+                
+                # Validação de Restrições
+                checks = {
+                    "Min_Diversif_Ampla": met["n_total_setores"] >= 4,
+                    "Cond_Tec_Energia": (met["n_tec"] == 0) or (met["n_ene"] >= 1),
+                    "Min_Defensivo": met["n_defensivos"] >= 1,
+                    "Min_Ciclico": met["n_ciclicos"] >= 1,
+                    "Controle_Commodities": met["n_commodities"] <= 1,
+                    "Limite_Juros": met["n_juros"] <= 2
+                }
+                
+                status = "Válido" if all(checks.values()) else " Inválido"
+
+                results.append({
+                    "seed": seed,
+                    "lambda": lambd,
+                    "status": status,
+                    "retorno": met["retorno"],
+                    "risco": met["risco"],
+                    "vol": np.sqrt(met["risco"]), # Assumindo que risco era variância ou similar no original? Original faz sqrt fora. Mantendo lógica original.
+                    **checks,
+                    "ativos": [self.data.tickers[i] for i in range(self.data.n_assets) if b_best[i] == 1],
+                    "setores": sorted(set(self.data.ticker_to_sector[t] for t in self.data.tickers if w_best[self.data.tickers.index(t)] > 0)),
+                    "pesos": w_best.tolist()
+                })
+        
+        return pd.DataFrame(results)
+
+# ============================================================
+# PÓS-PROCESSAMENTO E VISUALIZAÇÃO
+# ============================================================
+
+def process_results(df_results: pd.DataFrame, path_output: str) -> pd.DataFrame:
+    """Calcula fronteira de Pareto limpa e salva arquivos."""
+    
+    # Recalcular objetivo
+    df_results["obj"] = (
+        df_results["lambda"] * df_results["risco"] - 
+        (1 - df_results["lambda"]) * df_results["retorno"]
+    )
+
+    # Melhor por Lambda
+    idx_best = df_results.groupby("lambda")["obj"].idxmin()
+    df_best_lambda = df_results.loc[idx_best].reset_index(drop=True)
+
+    # Fronteira Limpa (Monotônica)
+    df_sorted = df_best_lambda.sort_values("risco").reset_index(drop=True)
+    pareto_points = []
+    last_risk = -np.inf
+    last_ret = -np.inf
+
+    for _, row in df_sorted.iterrows():
+        if row["risco"] > last_risk and row["retorno"] > last_ret:
+            pareto_points.append(row)
+            last_risk = row["risco"]
+            last_ret = row["retorno"]
+
+    df_frontier = pd.DataFrame(pareto_points).reset_index(drop=True)
+
+    # Salvamento
+    df_results.to_csv(f"{path_output}resultados_todas_seeds.csv", index=False)
+    df_best_lambda.to_csv(f"{path_output}melhor_por_lambda.csv", index=False)
+    df_frontier.to_csv(f"{path_output}fronteira_pareto_limpa.csv", index=False)
+    
+    return df_frontier
+
+def plot_frontier(df_results: pd.DataFrame, df_frontier: pd.DataFrame, path_exato: str, path_output: str):
+    """Gera o gráfico comparativo entre BRKGA e Modelo Exato."""
+    
+    # Carregar Modelo Exato (Lógica original de parsing mantida para compatibilidade)
+    try:
+        df_exato = pd.read_csv(path_exato, sep=";", engine="python")
+        df_exato.columns = df_exato.columns.str.lower().str.strip()
+        
+        # Limpeza e Conversão
+        df_exato["w_max"] = df_exato["w_max"].astype(str).str.replace(",", ".").astype(float)
+        df_sub = df_exato[(df_exato["w_max"] >= 0.249) & (df_exato["w_max"] <= 0.251)].copy()
+        
+        for col in ["risco", "retorno"]:
+            df_sub[col] = (
+                df_sub[col].astype(str)
+                .str.replace(",", ".", regex=False)
+                .str.extract(r"([0-9.]+)").astype(float)
+            )
+        
+        x_exato = df_sub["risco"].values
+        y_exato = df_sub["retorno"].values
+        
+        # Ordenação para plotagem
+        idx = np.argsort(x_exato)
+        x_uniq, idx_uniq = np.unique(x_exato[idx], return_index=True)
+        y_uniq = y_exato[idx][idx_uniq]
+        
+    except Exception as e:
+        print(f"⚠️ Aviso: Não foi possível carregar/processar modelo exato ({e}). Plotando apenas BRKGA.")
+        x_uniq, y_uniq = [], []
+
+    # Plotagem
+    plt.figure(figsize=(10, 7))
+
+    # Nuvem de pontos
+    plt.scatter(
+        df_results["risco"], df_results["retorno"],
+        alpha=0.20, s=10, color="gray", label="BRKGA — Todas Soluções"
+    )
+
+    # Fronteira BRKGA
+    x_front = df_frontier["risco"].values
+    y_front = df_frontier["retorno"].values
+    
+    if len(x_front) > 2:
+        x_smooth = np.linspace(x_front.min(), x_front.max(), 300)
+        y_smooth = PchipInterpolator(x_front, y_front)(x_smooth)
+        plt.plot(x_smooth, y_smooth, color="blue", linewidth=2.3, label="BRKGA — Fronteira")
+    else:
+        plt.plot(x_front, y_front, color="blue", linewidth=2.3, label="BRKGA — Fronteira")
+    
+    plt.scatter(x_front, y_front, s=35, color="blue")
+
+    # Fronteira Exata
+    if len(x_uniq) > 0:
+        plt.scatter(x_uniq, y_uniq, color="red", s=40, label="Pontos Exatos")
+        if len(x_uniq) > 2:
+            xs = np.linspace(x_uniq.min(), x_uniq.max(), 300)
+            ys = PchipInterpolator(x_uniq, y_uniq)(xs)
+            plt.plot(xs, ys, color="darkred", linewidth=2.3, label="Modelo Exato")
+        else:
+            plt.plot(x_uniq, y_uniq, color="darkred", linewidth=2.3)
+
+    plt.xlabel("Risco", fontsize=12)
+    plt.ylabel("Retorno", fontsize=12)
+    plt.title("Comparação: BRKGA vs Modelo Exato", fontsize=15)
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend(fontsize=11)
+    plt.tight_layout()
+    
+    plt.savefig(f"{path_output}comparacao_brkga_vs_exato.png", dpi=300)
+    plt.show()
+
+# ============================================================
+# EXECUÇÃO PRINCIPAL
+# ============================================================
+
+def main():
+    try:
+        # 1. Configuração e Dados
+        cfg = Config()
+        data = MarketData(cfg.ARQ_MU, cfg.ARQ_SIGMA, cfg.ARQ_SETORES)
+        
+        # 2. Otimização
+        optimizer = PortfolioOptimizer(data, cfg)
+        seeds_to_run = [42, 1, 5, 6, 7]
+        
+        print("Iniciando Otimização...")
+        df_results = optimizer.run_optimization(seeds_to_run)
+        
+        # 3. Processamento de Resultados
+        print("Calculando fronteira eficiente...")
+        df_frontier = process_results(df_results, cfg.PATH_RESULTS)
+        print(f"Resultados salvos em {cfg.PATH_RESULTS}")
+
+        # 4. Gráficos
+        plot_frontier(df_results, df_frontier, cfg.ARQ_EXATO, cfg.PATH_RESULTS)
+
+    except Exception as e:
+        print(f" Erro fatal na execução: {e}")
+        # Em produção, adicionar traceback: import traceback; traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
