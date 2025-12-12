@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Otimização de Portfólio via BRKGA.
-Refatorado para boas práticas e estrutura limpa.
-"""
-
 import numpy as np
 import pandas as pd
 import random
@@ -163,7 +157,7 @@ class MarketData:
             raise FileNotFoundError(f" ERRO: Arquivo {path} não encontrado.")
 
 # ============================================================
-# CORE DO OTIMIZADOR (BRKGA)
+# Core
 # ============================================================
 
 class PortfolioOptimizer:
@@ -401,7 +395,7 @@ def plot_frontier(df_results: pd.DataFrame, df_frontier: pd.DataFrame, path_exat
         y_uniq = y_exato[idx][idx_uniq]
         
     except Exception as e:
-        print(f"⚠️ Aviso: Não foi possível carregar/processar modelo exato ({e}). Plotando apenas BRKGA.")
+        print(f"Aviso: Não foi possível carregar/processar modelo exato ({e}). Plotando apenas BRKGA.")
         x_uniq, y_uniq = [], []
 
     # Plotagem
@@ -447,7 +441,7 @@ def plot_frontier(df_results: pd.DataFrame, df_frontier: pd.DataFrame, path_exat
     plt.show()
 
 # ============================================================
-# EXECUÇÃO PRINCIPAL
+# Main
 # ============================================================
 
 def main():
