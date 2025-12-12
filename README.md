@@ -22,7 +22,7 @@ O projeto está organizado da seguinte forma:
 
 ## 🚀 Pré-requisitos
 
-Para executar este projeto, necessitarás de **Python 3.x** e das seguintes bibliotecas:
+Para executar este projeto, é necessário o **Python 3.8** e das seguintes bibliotecas:
 
 ```bash
 pip install pandas numpy matplotlib seaborn requests amplpy scipy
