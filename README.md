@@ -69,7 +69,3 @@ Os resultados mostram a comparação entre a Fronteira Eficiente "verdadeira" (E
 ## 📝 Autores
 
   * Rafael Pires Moreira Silva e Maycon Prado
-
-
-1.  **Caminhos Relativos:** Nos ficheiros de implementação (como visto nos excertos), os caminhos estão absolutos (ex: `C:\Users\Cliente\...`). Sugiro alterá-los para caminhos relativos ou usar a biblioteca `os.path` para garantir que o código funcione em qualquer computador sem edições manuais.
-2.  **Requirements:** Cria um ficheiro `requirements.txt` para facilitar a instalação das dependências.
