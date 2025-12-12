@@ -1,0 +1,421 @@
+import os
+import time
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+from amplpy import AMPL, Environment
+from typing import List, Dict, Tuple, Optional, Any
+
+# ==============================================================================
+# 1. CONFIGURAÇÃO GERAL
+# ==============================================================================
+
+class Config:    
+    # Caminhos (Ajuste conforme seu ambiente)
+    BASE_PATH_DADOS = r"C:\Users\Cliente\Desktop\Dados IPO"
+    PATH_AMPL_SYSTEM = r"C:\Users\Cliente\AMPL"
+    PATH_OUTPUT = "Resultados_Otimizacao_Exata"
+
+    # Nomes dos arquivos
+    FILE_MU = "vetor_retornos_calculado.csv"
+    FILE_SIGMA = "matriz_covariancia_calculada.csv"
+    FILE_SETORES = "mapeamento_setores.csv"
+
+    # Parâmetros de Simulação
+    CARDINALIDADES = [10, 15, 20, 25, 30]  # Lista de 'm'
+    W_MAX_LIST = [0.25]                    # Lista de pesos máximos
+    TAXA_LIVRE_RISCO = 0.15
+    W_MIN = 0.01                           # 1% de peso mínimo se escolhido
+    
+    # Configuração do Solver
+    SOLVER = 'gurobi'
+    SOLVER_OPTIONS = 'outlev=0 mipgap=0.001 timelimit=300 presolve=2'
+
+    # Definição dos Grupos Setoriais (Regras de Negócio)
+    GRUPOS_SETORIAIS = {
+        'SETORES_FINANCEIROS': ['Financials'],
+        'SETORES_DEFENSIVOS': ['Consumer Staples', 'Health Care', 'Utilities'],
+        'SETORES_CICLICOS': ['Consumer Discretionary', 'Financials', 'Industrials', 
+                             'Real Estate', 'Information Technology', 'Communication Services'],
+        'SETORES_COMMODITIES': ['Energy', 'Materials'],
+        'SETORES_SENSIVEIS_JUROS': ['Financials', 'Utilities', 'Real Estate'],
+        'SETOR_TECNOLOGIA': ['Information Technology'],
+        'SETOR_ENERGIA_ELETRICA': ['Utilities']
+    }
+
+# ==============================================================================
+# 2. MODELO AMPL 
+# ==============================================================================
+
+MODELO_AMPL = """
+# --- CONJUNTOS ---
+set ATIVOS;
+set SETORES;
+set Ativos_Por_Setor {SETORES} within ATIVOS;
+
+# Conjuntos de Regras de Negócio
+set SETORES_FINANCEIROS within SETORES;
+set SETORES_DEFENSIVOS within SETORES;
+set SETORES_CICLICOS within SETORES;
+set SETORES_COMMODITIES within SETORES;
+set SETOR_TECNOLOGIA within SETORES;
+set SETOR_ENERGIA_ELETRICA within SETORES;
+set SETORES_SENSIVEIS_JUROS within SETORES;
+
+# --- PARAMETROS ---
+param m;             # Cardinalidade
+param W_max;         # Peso máximo por ativo
+param W_min;         # Peso mínimo por ativo
+param R_target;      # Retorno alvo mínimo
+param mu {ATIVOS};   # Vetor de retornos
+param Sigma {ATIVOS, ATIVOS}; # Matriz de covariância
+
+# --- VARIAVEIS ---
+var w {ATIVOS} >= 0;    
+var b {ATIVOS} binary;  
+var y {SETORES} binary; 
+
+# --- OBJETIVO ---
+minimize Risco_Portfolio:
+    sum {i in ATIVOS, j in ATIVOS} w[i] * Sigma[i,j] * w[j];
+
+# --- RESTRICOES ---
+subject to
+    Soma_Pesos: 
+        sum {i in ATIVOS} w[i] = 1;
+
+    Retorno_Alvo: 
+        sum {i in ATIVOS} mu[i] * w[i] >= R_target;
+
+    Cardinalidade: 
+        sum {i in ATIVOS} b[i] = m;
+
+    # Constraints de Ligação (Big-M implícito pelos limites)
+    Aporte_maximo {i in ATIVOS}: 
+        w[i] <= W_max * b[i];
+
+    Aporte_minimo {i in ATIVOS}: 
+        w[i] >= W_min * b[i];
+    
+    # Lógica Setorial (Ativação de Setor)
+    Conecta_b_y_Inferior {s in SETORES}:
+        y[s] <= sum {i in Ativos_Por_Setor[s]} b[i];
+    
+    Conecta_b_y_Superior {s in SETORES}:
+        sum {i in Ativos_Por_Setor[s]} b[i] <= card(Ativos_Por_Setor[s]) * y[s];
+
+    # Regras de Negócio Específicas
+    Condicional_Tec_Energia:
+        sum {s in SETOR_TECNOLOGIA} y[s] <= sum {s in SETOR_ENERGIA_ELETRICA} y[s];
+
+    Min_Diversificacao_Defensivo:
+        sum {s in SETORES_DEFENSIVOS} y[s] >= 1;
+
+    Min_Diversificacao_Ciclico:
+        sum {s in SETORES_CICLICOS} y[s] >= 1;
+
+    Controle_Commodities:
+        sum {s in SETORES_COMMODITIES} y[s] <= 1;
+        
+    Minima_Diversificacao_Ampla:
+        sum {s in SETORES} y[s] >= 4;
+
+    Limite_Exposicao_Juros:
+        sum {s in SETORES_SENSIVEIS_JUROS} y[s] <= 2;
+"""
+
+# ==============================================================================
+# 3. GERENCIAMENTO DE DADOS
+# ==============================================================================
+
+class DataLoader:
+    
+    def __init__(self, config: Config):
+        self.cfg = config
+
+    def load_all(self) -> Tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
+        try:
+            print(">>> Carregando arquivos de dados...")
+            path_mu = os.path.join(self.cfg.BASE_PATH_DADOS, self.cfg.FILE_MU)
+            path_sigma = os.path.join(self.cfg.BASE_PATH_DADOS, self.cfg.FILE_SIGMA)
+            path_setores = os.path.join(self.cfg.BASE_PATH_DADOS, self.cfg.FILE_SETORES)
+
+            mu = pd.read_csv(path_mu, index_col=0).squeeze('columns')
+            sigma = pd.read_csv(path_sigma, index_col=0)
+            df_setores = pd.read_csv(path_setores)
+
+            # Validação básica de integridade
+            if not all(mu.index.equals(sigma.index) and mu.index.equals(sigma.columns)):
+                raise ValueError("Erro: Índices de Mu e Sigma não coincidem.")
+            
+            print(">>> Dados carregados com sucesso.")
+            return mu, sigma, df_setores
+
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"❌ Erro Crítico: Arquivo não encontrado - {e.filename}")
+        except Exception as e:
+            raise RuntimeError(f"❌ Erro ao processar dados: {e}")
+
+# ==============================================================================
+# 4. GERENCIADOR AMPL
+# ==============================================================================
+
+class AmplManager:
+
+    def __init__(self, config: Config):
+        self.cfg = config
+        self.ampl: Optional[AMPL] = None
+        self._setup_environment()
+
+    def _setup_environment(self):
+        if self.cfg.PATH_AMPL_SYSTEM not in os.environ['PATH']:
+            os.environ['PATH'] = self.cfg.PATH_AMPL_SYSTEM + os.pathsep + os.environ['PATH']
+        try:
+            env = Environment(self.cfg.PATH_AMPL_SYSTEM)
+            self.ampl = AMPL(env)
+        except Exception as e:
+            raise RuntimeError(f"Falha ao iniciar ambiente AMPL: {e}")
+
+    def load_model_and_data(self, mu: pd.Series, sigma: pd.DataFrame, df_mapeamento: pd.DataFrame):
+        if not self.ampl:
+            return
+
+        print("\n>>> Configurando modelo AMPL e enviando dados estáticos...")
+        self.ampl.eval(MODELO_AMPL)
+
+        # Preparação dos Sets
+        ativos = sigma.columns.tolist()
+        
+        # Filtra mapeamento apenas para ativos presentes na Sigma
+        map_filtrado = df_mapeamento[df_mapeamento['Ticker'].isin(ativos)].set_index('Ticker')['Setor'].to_dict()
+        setores_unicos = sorted(list(set(map_filtrado.values())))
+
+        # 1. Sets Básicos
+        self.ampl.set['ATIVOS'] = ativos
+        self.ampl.set['SETORES'] = setores_unicos
+
+        # 2. Sets de Regras de Negócio (Interseção entre sets definidos e setores presentes)
+        for nome_grupo, lista_setores in self.cfg.GRUPOS_SETORIAIS.items():
+            setores_validos = [s for s in lista_setores if s in setores_unicos]
+            self.ampl.get_set(nome_grupo).set_values(setores_validos)
+
+        # 3. Set Indexado: Ativos_Por_Setor
+        for setor in setores_unicos:
+            tickers_do_setor = [t for t, s in map_filtrado.items() if s == setor]
+            self.ampl.get_set('Ativos_Por_Setor')[setor].set_values(tickers_do_setor)
+
+        # 4. Parâmetros Numéricos Estáticos
+        print(">>> Enviando matrizes Mu e Sigma...")
+        self.ampl.param['mu'].set_values(mu)
+        self.ampl.param['Sigma'].set_values(sigma)
+
+        # 5. Configuração do Solver
+        self.ampl.option['solver'] = self.cfg.SOLVER
+        self.ampl.option['gurobi_options'] = self.cfg.SOLVER_OPTIONS
+        print(">>> Modelo pronto.")
+
+    def solve_scenario(self, m: int, w_max: float, r_target: float) -> Tuple[bool, Dict[str, Any]]:
+        try:
+            # Atualiza Parâmetros Dinâmicos
+            self.ampl.param['m'] = m
+            self.ampl.param['W_max'] = w_max
+            self.ampl.param['R_target'] = r_target
+            self.ampl.param['W_min'] = self.cfg.W_MIN
+
+            # Solve
+            self.ampl.solve()
+            
+            result_status = self.ampl.get_value('solve_result')
+            
+            # Coleta de Resultados se resolvido
+            if result_status in ['solved', 'limit']:
+                risco = np.sqrt(self.ampl.get_objective('Risco_Portfolio').value())
+                retorno = self.ampl.get_value('sum {i in ATIVOS} mu[i] * w[i]')
+                
+                # Extrair pesos
+                df_w = self.ampl.get_variable('w').to_pandas()
+                ativos_selecionados = df_w[df_w['w'] > 1e-5].copy() # Filtro de sujeira numérica
+                
+                return True, {
+                    'status': result_status,
+                    'risco': risco,
+                    'retorno': retorno,
+                    'carteira': ativos_selecionados
+                }
+            
+            return False, {'status': result_status}
+
+        except Exception as e:
+            print(f"Erro no solver: {e}")
+            return False, {'status': 'error'}
+
+    def close(self):
+        if self.ampl:
+            self.ampl.close()
+
+# ==============================================================================
+# 5. PROCESSAMENTO DE RESULTADOS E VISUALIZAÇÃO
+# ==============================================================================
+
+class ResultProcessor:    
+    @staticmethod
+    def save_and_plot(df_resumo: pd.DataFrame, df_detalhado: pd.DataFrame, path_pasta: str, m: int):
+        if df_resumo.empty:
+            print(f"   [AVISO] Sem resultados para processar em m={m}.")
+            return
+
+        # 1. Salvar CSVs
+        df_resumo.to_csv(os.path.join(path_pasta, "relatorio_resumo.csv"), index=False, sep=';', decimal=',')
+        df_detalhado.to_csv(os.path.join(path_pasta, "relatorio_composicao.csv"), index=False, sep=';', decimal=',')
+
+        # 2. Filtrar dados válidos para plotagem
+        df_sol = df_resumo[df_resumo['Status'].isin(['solved', 'limit'])].copy()
+        df_sol = df_sol.replace([np.inf, -np.inf], np.nan).dropna(subset=['Risco', 'Retorno', 'Sharpe'])
+
+        if not df_sol.empty:
+            # Melhor Sharpe
+            best = df_sol.loc[df_sol['Sharpe'].idxmax()]
+            
+            # 3. Gerar Gráfico
+            plt.figure(figsize=(12, 8))
+            sns.scatterplot(
+                data=df_sol, x='Risco', y='Retorno', 
+                hue='W_max', style='W_max', palette='viridis', s=100, alpha=0.9
+            )
+            
+            # Destaque Campeã
+            plt.scatter(
+                best['Risco'], best['Retorno'], 
+                color='red', marker='*', s=600, edgecolors='black', zorder=10,
+                label=f"TOP Sharpe ({best['Sharpe']:.2f})"
+            )
+            
+            plt.title(f'Fronteira Eficiente (Exata) - {m} Ativos')
+            plt.xlabel('Risco (Volatilidade)')
+            plt.ylabel('Retorno Esperado')
+            plt.gca().xaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.1%}'))
+            plt.gca().yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y:.1%}'))
+            plt.legend(title='W_max')
+            plt.grid(True, alpha=0.3)
+            
+            plt.savefig(os.path.join(path_pasta, "Grafico_Fronteira.png"), dpi=150)
+            plt.close()
+
+            # 4. Salvar Melhor Carteira isolada
+            id_best = best['ID_Simulacao']
+            df_best_w = df_detalhado[df_detalhado['ID_Simulacao'] == id_best].copy()
+            df_best_w = df_best_w[['Ticker', 'Peso']].sort_values(by='Peso', ascending=False)
+            df_best_w.to_csv(os.path.join(path_pasta, "MELHOR_CARTEIRA.csv"), index=False, sep=';', decimal=',')
+            
+            print(f"   [OK] Processamento concluído. Melhor Sharpe: {best['Sharpe']:.2f}")
+        else:
+            print("   [AVISO] Nenhuma solução viável para gerar gráfico.")
+
+# ==============================================================================
+# 6. Main
+# ==============================================================================
+
+def main():
+    print(">>> Iniciando Sistema de Otimização Exata (AMPL) <<<")
+    
+    cfg = Config()
+    
+    # 1. Carregar Dados
+    loader = DataLoader(cfg)
+    try:
+        mu, sigma, df_map = loader.load_all()
+    except Exception as e:
+        print(e)
+        return
+
+    # 2. Configurar Retornos Alvo (Grid)
+    max_retorno_teorico = mu.max()
+    targets_retorno = np.linspace(0.12, max_retorno_teorico * 0.99, 40)
+    print(f">>> Grid de Retornos gerado: 12% a {max_retorno_teorico:.2%}")
+
+    # 3. Inicializar AMPL
+    try:
+        ampl_mgr = AmplManager(cfg)
+        ampl_mgr.load_model_and_data(mu, sigma, df_map)
+    except Exception as e:
+        print(f"Erro fatal AMPL: {e}")
+        return
+
+    # 4. Loop Principal (Por Cardinalidade)
+    os.makedirs(cfg.PATH_OUTPUT, exist_ok=True)
+    
+    total_iterations = len(cfg.CARDINALIDADES) * len(cfg.W_MAX_LIST) * len(targets_retorno)
+    global_counter = 0
+
+    try:
+        for m in cfg.CARDINALIDADES:
+            print("\n" + "="*60)
+            print(f"   ANALISANDO CARDINALIDADE: {m} ATIVOS")
+            print("="*60)
+
+            path_pasta_m = os.path.join(cfg.PATH_OUTPUT, f"Carteira_{m}_Ativos")
+            os.makedirs(path_pasta_m, exist_ok=True)
+
+            resultados = []
+            composicao = []
+
+            for w_max in cfg.W_MAX_LIST:
+                for r_target in targets_retorno:
+                    global_counter += 1
+                    sim_id = f"Sim_{global_counter:04d}"
+                    
+                    print(f"\rProcessando: m={m} | W={w_max:.0%} | R={r_target:.1%}", end="")
+                    
+                    # Resolve
+                    sucesso, dados = ampl_mgr.solve_scenario(m, w_max, r_target)
+                    
+                    row_resumo = {
+                        'ID_Simulacao': sim_id,
+                        'm': m, 'W_max': w_max, 'R_target': r_target,
+                        'Status': dados['status'],
+                        'Risco': None, 'Retorno': None, 'Sharpe': None, 'Carteira_Resumo': ''
+                    }
+
+                    if sucesso:
+                        r_val, risk_val = dados['retorno'], dados['risco']
+                        sharpe = (r_val - cfg.TAXA_LIVRE_RISCO) / risk_val if risk_val > 1e-6 else 0
+                        
+                        df_carteira = dados['carteira']
+                        # String de resumo
+                        resumo_str = ", ".join([f"{idx}: {row.w:.1%}" for idx, row in df_carteira.iterrows()])
+                        
+                        row_resumo.update({
+                            'Risco': risk_val, 'Retorno': r_val, 'Sharpe': sharpe, 
+                            'Carteira_Resumo': resumo_str
+                        })
+
+                        # Adicionar à lista detalhada
+                        for ticker, row_w in df_carteira.iterrows():
+                            composicao.append({
+                                'ID_Simulacao': sim_id,
+                                'Ticker': ticker,
+                                'Peso': row_w['w'],
+                                'm_Cenario': m,
+                                'W_max_Cenario': w_max,
+                                'R_target_Cenario': r_target
+                            })
+                    
+                    resultados.append(row_resumo)
+
+            # Processar resultados desta cardinalidade
+            df_res = pd.DataFrame(resultados)
+            df_comp = pd.DataFrame(composicao)
+            ResultProcessor.save_and_plot(df_res, df_comp, path_pasta_m, m)
+
+    except KeyboardInterrupt:
+        print("\n\nExecução interrompida pelo usuário.")
+    except Exception as e:
+        print(f"\n\nErro durante a execução: {e}")
+    finally:
+        ampl_mgr.close()
+        print("\n>>> AMPL Encerrado.")
+
+if __name__ == "__main__":
+    main()
