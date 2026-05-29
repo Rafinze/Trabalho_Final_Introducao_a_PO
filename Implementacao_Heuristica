@@ -10,7 +10,6 @@ from typing import Dict, List, Tuple, Any, Optional
 # ============================================================
 
 class Config:
-    """Centraliza constantes e caminhos de arquivo."""
     # Caminhos de Entrada
     ARQ_MU = "vetor_retornos_calculado.csv"
     ARQ_SIGMA = "matriz_covariancia_calculada.csv"
